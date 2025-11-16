@@ -25,3 +25,9 @@ black==24.8.0
 ruff==0.6.0
 
 mypy==1.11.0
+
+
+###Shubhra Models
+#Flights
+httpx
+pydantic
