@@ -4,6 +4,39 @@ from models.state import AppState, Message, BundleQuote
 from graph.policies import should_call_tools, invariants_pass
 
 
+def build_planner_subgraph():
+    planner_graph = StateGraph(AppState)
+    # 2. Add Nodes
+    planner_graph.add_node("extract_slots", extract_slots)
+    planner_graph.add_node("validate_slots", validate_slots)
+    planner_graph.add_node("generate_itinerary", generate_itinerary)
+    planner_graph.add_node("respond_clarification", respond_clarification)
+
+    # 3. Define Edges (Transitions)
+    planner_graph.set_entry_point("extract_slots")
+
+    # Conditional Edge after Slot Validation
+    planner_graph.add_conditional_edges(
+        "validate_slots", 
+        lambda state: state.get("next_action"), # Uses the next_action hint from the node
+        {
+            "generate_itinerary": "generate_itinerary",
+            "respond_clarification": "respond_clarification",
+        }
+    )
+
+    # Fixed Edges
+    planner_graph.add_edge("extract_slots", "validate_slots")
+
+
+    planner_graph.add_edge("generate_itinerary", END) # End of Planner's task, goes back to Supervisor
+    planner_graph.add_edge("respond_clarification", END) # Handoff to Supervisor for user response
+
+    return planner_graph.compile()
+
+# 4. Compile the Subgraph
+PLANNER_SUBGRAPH = build_planner_subgraph.compile()
+
 class GraphState(TypedDict, total=False):
     # Stored as plain dict for LangGraph; validated via AppState when needed
     session_id: str
@@ -99,7 +132,8 @@ def respond(state: GraphState) -> Dict[str, Any]:
 
 def build_supervisor():
     graph = StateGraph(GraphState)
-
+    
+    graph.add_node("planner_agent", PLANNER_SUBGRAPH)
     graph.add_node("supervisor_llm", supervisor_llm)
     graph.add_node("tool_handoff", tool_handoff)
     graph.add_node("respond", respond)
@@ -109,17 +143,24 @@ def build_supervisor():
 
     # Conditional routing: supervisor -> tools or respond
     def route_from_supervisor(state: GraphState) -> str:
-        if should_call_tools(state):
+        s = AppState(**state)
+
+        if not s.trip_slots.destination and any(k in s.messages[-1].content.lower() for k in ["plan", "trip", "go to"]):
+            return "planner_agent"
+        
+        if s.itinerary_draft and should_call_tools(state):
             return "tool_handoff"
+
         return "respond"
 
     graph.add_conditional_edges("supervisor_llm", route_from_supervisor, {
+        "planner_agent": "planner_agent",
         "tool_handoff": "tool_handoff",
         "respond": "respond",
     })
 
     # After tools, go back to supervisor for another decision
-    graph.add_edge("tool_handoff", "supervisor_llm")
+    graph.add_edge("planner_agent", "tool_handoff", "supervisor_llm")
 
     # Respond either ends or loops (handled inside node; we route to END here)
     graph.add_edge("respond", END)
